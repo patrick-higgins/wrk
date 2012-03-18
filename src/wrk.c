@@ -32,6 +32,7 @@ static struct config {
     uint64_t threads;
     uint64_t connections;
     uint64_t duration;
+    uint64_t pipeline;
     uint64_t timeout;
 } cfg;
 
@@ -66,6 +67,7 @@ static void usage() {
            "    -H, --header      <H>  Add header to request      \n"
            "        --timeout     <T>  Socket/request timeout     \n"
            "    -v, --version          Print version details      \n"
+           "        --pipeline    <n>  Send N pipelined requests  \n"
            "                                                      \n"
            "  Numeric arguments may include a SI unit (1k, 1M, 1G)\n"
            "  Time arguments may include a time unit (2s, 2m, 2h)\n");
@@ -308,11 +310,14 @@ static int request_complete(http_parser *parser) {
         goto done;
     }
 
+    if (--c->pending == 0) c->latency = time_us() - c->start;
     if (!http_should_keep_alive(parser)) goto reconnect;
 
     http_parser_init(parser, HTTP_RESPONSE);
-    aeDeleteFileEvent(thread->loop, c->fd, AE_READABLE);
-    aeCreateFileEvent(thread->loop, c->fd, AE_WRITABLE, socket_writeable, c);
+    if (c->pending == 0) {
+        aeDeleteFileEvent(thread->loop, c->fd, AE_READABLE);
+        aeCreateFileEvent(thread->loop, c->fd, AE_WRITABLE, socket_writeable, c);
+    }
 
     goto done;
 
@@ -346,8 +351,12 @@ static int check_timeouts(aeEventLoop *loop, long long id, void *data) {
 static void socket_writeable(aeEventLoop *loop, int fd, void *data, int mask) {
     connection *c = data;
 
-    if (write(fd, request.buf, request.size) < request.size) goto error;
     c->start = time_us();
+
+    for (c->pending = 0; c->pending < cfg.pipeline; c->pending++) {
+        if (write(fd, request.buf, request.size) < request.size) goto error;
+    }
+
     aeDeleteFileEvent(loop, fd, AE_WRITABLE);
     aeCreateFileEvent(loop, fd, AE_READABLE, socket_readable, c);
 
@@ -429,6 +438,7 @@ static struct option longopts[] = {
     { "threads",     required_argument, NULL, 't' },
     { "header",      required_argument, NULL, 'H' },
     { "timeout",     required_argument, NULL, 'T' },
+    { "pipeline",    required_argument, NULL, 'P' },
     { "help",        no_argument,       NULL, 'h' },
     { "version",     no_argument,       NULL, 'v' },
     { NULL,          0,                 NULL,  0  }
@@ -441,9 +451,10 @@ static int parse_args(struct config *cfg, char **url, char **headers, int argc, 
     cfg->threads     = 2;
     cfg->connections = 10;
     cfg->duration    = 10;
+    cfg->pipeline    = 1;
     cfg->timeout     = SOCKET_TIMEOUT_MS;
 
-    while ((c = getopt_long(argc, argv, "t:c:d:H:T:rv?", longopts, NULL)) != -1) {
+    while ((c = getopt_long(argc, argv, "t:c:d:H:P:T:rv?", longopts, NULL)) != -1) {
         switch (c) {
             case 't':
                 if (scan_metric(optarg, &cfg->threads)) return -1;
@@ -460,6 +471,8 @@ static int parse_args(struct config *cfg, char **url, char **headers, int argc, 
             case 'T':
                 if (scan_time(optarg, &cfg->timeout)) return -1;
                 cfg->timeout *= 1000;
+            case 'P':
+                if (scan_metric(optarg, &cfg->pipeline)) return -1;
                 break;
             case 'v':
                 printf("wrk %s [%s] ", VERSION, aeGetApiName());
